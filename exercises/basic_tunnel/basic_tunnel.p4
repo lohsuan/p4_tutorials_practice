@@ -2,6 +2,17 @@
 #include <core.p4>
 #include <v1model.p4>
 
+/*
+在計算機網絡中，tunnel 是指在一個協議（比如IP）下封裝其他協議（Ex: IPv4, IPv6）的通訊方法。
+在這個例子中，tunnel 是指在 IP router 中增加一個新的封裝頭（tunnel header），
+以在 IP packet 上進行封裝，實現基本的隧道協議。
+
+這個新的 tunnel header 中包含了
+1. protocal ID，用來表示封裝的 packet 是什麼類型
+2. destination ID，用於選擇路由
+通過這種方式在一個協議下封裝另一個協議，使得數據可以在網絡中傳輸並正確路由到目的地。
+*/
+
 // NOTE: new type added here
 const bit<16> TYPE_MYTUNNEL = 0x1212;
 const bit<16> TYPE_IPV4 = 0x800;
@@ -22,8 +33,8 @@ header ethernet_t {
 
 // NOTE: added new header type
 header myTunnel_t {
-    bit<16> proto_id;
-    bit<16> dst_id;
+    bit<16> proto_id;   // protocol ID: indicates the type of packet being encapsulated
+    bit<16> dst_id;     // destination ID: for routing
 }
 
 header ipv4_t {
@@ -69,6 +80,17 @@ parser MyParser(packet_in packet,
     state parse_ethernet {
         packet.extract(hdr.ethernet);
         transition select(hdr.ethernet.etherType) {
+            TYPE_MYTUNNEL : parse_myTunnel;
+            TYPE_IPV4 : parse_ipv4;
+            default : accept;
+        }
+    }
+
+   state parse_myTunnel {
+        packet.extract(hdr.myTunnel);
+        // The parser should also extract the ipv4 header 
+        // after the myTunnel header if proto_id == TYPE_IPV4
+        transition select(hdr.myTunnel.proto_id) {
             TYPE_IPV4 : parse_ipv4;
             default : accept;
         }
@@ -123,16 +145,36 @@ control MyIngress(inout headers hdr,
     }
 
     // TODO: declare a new action: myTunnel_forward(egressSpec_t port)
-
+    // simply sets the egress port (i.e. egress_spec field of the standard_metadata bus) 
+    // to the port number provided by the control plane.
+    action myTunnel_forward(egressSpec_t port) {
+        standard_metadata.egress_spec = port;
+    }
 
     // TODO: declare a new table: myTunnel_exact
     // TODO: also remember to add table entries!
-
+    table myTunnel_exact {
+        key = {
+            hdr.myTunnel.dst_id: exact;
+        }
+        actions = {
+            myTunnel_forward; // if there is a match in the table
+            drop;             // otherwise
+        }
+        size = 1024;
+        default_action = drop();
+    }
 
     apply {
         // TODO: Update control flow
-        if (hdr.ipv4.isValid()) {
+        if (hdr.ipv4.isValid() && !hdr.myTunnel.isValid()) {
+            // Process only non-tunneled IPv4 packets
             ipv4_lpm.apply();
+        }
+
+        if (hdr.myTunnel.isValid()) {
+            // process tunneled packets
+            myTunnel_exact.apply();
         }
     }
 }
@@ -176,9 +218,13 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
 *************************************************************************/
 
 control MyDeparser(packet_out packet, in headers hdr) {
+    // Remember that the deparser will only emit a header if it is valid. 
+    // A header's implicit validity bit is set by the parser upon extraction. 
+    // So there is no need to check header validity here.
     apply {
         packet.emit(hdr.ethernet);
         // TODO: emit myTunnel header as well
+        packet.emit(hdr.myTunnel);
         packet.emit(hdr.ipv4);
     }
 }
